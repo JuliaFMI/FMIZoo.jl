@@ -37,7 +37,8 @@ using FMIImport, OrdinaryDiffEqTsit5
     @test split[end-3] == "Dymola"
     @test split[end-4] == "bin"
     @test split[end-5] == "models"
-    @test split[end-6] == "FMIZoo.jl"
+    # the package root, named `FMIZoo.jl` in a git checkout but `FMIZoo/<slug>` when installed (e.g. by PkgEval)
+    @test joinpath(split[1:(end-6)]...) == pkgdir(FMIZoo)
 
     path = get_model_filename("BouncingBall", "ModelicaReferenceFMUs", "0.0.14", "3.0")
     @test length(path) > 0
