@@ -611,8 +611,11 @@ Status setFMUState(ModelInstance* comp, void* FMUState) {
     comp->clocksTicked = s->clocksTicked;
 
     comp->isDirtyValues = s->isDirtyValues;
+    comp->isDirtyJacobian = s->isDirtyJacobian;
+    comp->jacobianEpoch = s->jacobianEpoch;
 
     comp->modelData = s->modelData;
+    memcpy(comp->ballJacobians, s->ballJacobians, sizeof(comp->ballJacobians));
 
     comp->nSteps = s->nSteps;
 

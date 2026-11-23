@@ -617,19 +617,25 @@ fmi3Status fmi3SetFloat64(fmi3Instance instance,
     size_t nValueReferences,
     const fmi3Float64 values[],
     size_t nValues) {
-        
-    ModelInstance* comp = (ModelInstance*)instance;
+
+    BEGIN_FUNCTION(SetFloat64);
+
+    if (nValueReferences == 0) goto TERMINATE;
+    ASSERT_NOT_NULL(valueReferences);
+    ASSERT_NOT_NULL(values);
+
+    if (nValueReferences != nValues) {
+        logError(S, "Expected nValues = %zu but was %zu.", nValueReferences, nValues);
+        CALL(Error);
+    }
 
     for (size_t i = 0; i < nValueReferences; i++) {
-        
-        Status status = setFloat64(comp, valueReferences[i], values[i]);
-        
-        if (status != OK) {
-            return fmi3Error;
-        }
+        CALL(setFloat64(S, (ValueReference)valueReferences[i], values[i]));
     }
-    
-    return fmi3OK;
+
+    S->isDirtyValues = true;
+
+    END_FUNCTION();
 }
 
 fmi3Status fmi3SetInt8(fmi3Instance instance,
@@ -894,16 +900,86 @@ fmi3Status fmi3GetDirectionalDerivative(fmi3Instance instance,
 
     BEGIN_FUNCTION(GetDirectionalDerivative);
 
-    // TODO: check value references
-    // TODO: assert nUnknowns == nDeltaOfUnknowns
-    // TODO: assert nKnowns == nDeltaKnowns
+    // 1. Fast path for special cases (event indicator w.r.t. x; x. w.r.t. x; etc.) using pre-populated Jacobian matrix
+    if (evalSpecialJVP(S, (const ValueReference*)unknowns, nUnknowns, (const ValueReference*)knowns, nKnowns, seed, sensitivity)) {
+        goto TERMINATE;
+    }
 
-    for (size_t i = 0; i < nUnknowns; i++) {
-        sensitivity[i] = 0;
+    // 2. General case (lazy cache update occurs only in getPartialDerivative if needed!)
+    memset(sensitivity, 0, nUnknowns * sizeof(fmi3Float64));
+
+    if (nKnowns > 2 && nUnknowns > 2 && nUnknowns <= (size_t)(VARS_PER_BALL * NUM_BALLS + 64)) {
+        // O(nUnknowns + nKnowns) grouping of unknowns by ball index (avoids O(N^2) inner loop)
+        int head[NUM_BALLS];
+        int nextUnk[VARS_PER_BALL * NUM_BALLS + 64];
+        int globalUnk[64];
+        size_t nGlobalUnk = 0;
+
+        memset(head, -1, sizeof(head));
+
+        for (size_t i = nUnknowns; i-- > 0; ) {
+            ValueReference vrUnk = (ValueReference)unknowns[i];
+            if (vrUnk < START_VR) {
+                if (nGlobalUnk < 64) {
+                    globalUnk[nGlobalUnk++] = (int)i;
+                }
+            } else {
+                size_t b = (vrUnk - START_VR) / VARS_PER_BALL;
+                if (b < NUM_BALLS) {
+                    nextUnk[i] = head[b];
+                    head[b] = (int)i;
+                }
+            }
+        }
+
         for (size_t j = 0; j < nKnowns; j++) {
-            double partialDerivative = 0;
-            CALL(getPartialDerivative(S, (ValueReference)unknowns[i], (ValueReference)knowns[j], &partialDerivative));
-            sensitivity[i] += partialDerivative * seed[j];
+            const double s_j = seed[j];
+            if (s_j == 0.0) continue;
+
+            ValueReference vrKnown = (ValueReference)knowns[j];
+            if (vrKnown < START_VR) {
+                for (size_t i = 0; i < nUnknowns; i++) {
+                    double partialDerivative = 0.0;
+                    CALL(getPartialDerivative(S, (ValueReference)unknowns[i], vrKnown, &partialDerivative));
+                    sensitivity[i] += partialDerivative * s_j;
+                }
+            } else {
+                size_t idxKnown = (vrKnown - START_VR) / VARS_PER_BALL;
+                if (idxKnown < NUM_BALLS) {
+                    for (int i = head[idxKnown]; i != -1; i = nextUnk[i]) {
+                        double partialDerivative = 0.0;
+                        CALL(getPartialDerivative(S, (ValueReference)unknowns[i], vrKnown, &partialDerivative));
+                        sensitivity[i] += partialDerivative * s_j;
+                    }
+                }
+                for (size_t g = nGlobalUnk; g-- > 0; ) {
+                    int i = globalUnk[g];
+                    double partialDerivative = 0.0;
+                    CALL(getPartialDerivative(S, (ValueReference)unknowns[i], vrKnown, &partialDerivative));
+                    sensitivity[i] += partialDerivative * s_j;
+                }
+            }
+        }
+    } else {
+        for (size_t j = 0; j < nKnowns; j++) {
+            const double s_j = seed[j];
+            if (s_j == 0.0) continue;
+
+            ValueReference vrKnown = (ValueReference)knowns[j];
+            bool isKnownGlobal = (vrKnown < START_VR);
+            size_t idxKnown = isKnownGlobal ? 0 : (vrKnown - START_VR) / VARS_PER_BALL;
+
+            for (size_t i = 0; i < nUnknowns; i++) {
+                ValueReference vrUnk = (ValueReference)unknowns[i];
+
+                if (!isKnownGlobal && vrUnk >= START_VR) {
+                    if (((vrUnk - START_VR) / VARS_PER_BALL) != idxKnown) continue;
+                }
+
+                double partialDerivative = 0.0;
+                CALL(getPartialDerivative(S, vrUnk, vrKnown, &partialDerivative));
+                sensitivity[i] += partialDerivative * s_j;
+            }
         }
     }
 
@@ -925,14 +1001,86 @@ fmi3Status fmi3GetAdjointDerivative(fmi3Instance instance,
 
     BEGIN_FUNCTION(GetAdjointDerivative);
 
-    // TODO: check value references
+    // 1. Fast path for special cases (event indicator w.r.t. x; x. w.r.t. x; etc.) using pre-populated Jacobian matrix
+    if (evalSpecialVJP(S, (const ValueReference*)unknowns, nUnknowns, (const ValueReference*)knowns, nKnowns, seed, sensitivity)) {
+        goto TERMINATE;
+    }
 
-    for (size_t i = 0; i < nKnowns; i++) {
-        sensitivity[i] = 0;
+    // 2. General case (lazy cache update occurs only in getPartialDerivative if needed!)
+    memset(sensitivity, 0, nKnowns * sizeof(fmi3Float64));
+
+    if (nUnknowns > 2 && nKnowns > 2 && nKnowns <= (size_t)(VARS_PER_BALL * NUM_BALLS + 64)) {
+        // O(nKnowns + nUnknowns) grouping of knowns by ball index (avoids O(N^2) inner loop)
+        int head[NUM_BALLS];
+        int nextKnown[VARS_PER_BALL * NUM_BALLS + 64];
+        int globalKnown[64];
+        size_t nGlobalKnown = 0;
+
+        memset(head, -1, sizeof(head));
+
+        for (size_t i = nKnowns; i-- > 0; ) {
+            ValueReference vrKnown = (ValueReference)knowns[i];
+            if (vrKnown < START_VR) {
+                if (nGlobalKnown < 64) {
+                    globalKnown[nGlobalKnown++] = (int)i;
+                }
+            } else {
+                size_t b = (vrKnown - START_VR) / VARS_PER_BALL;
+                if (b < NUM_BALLS) {
+                    nextKnown[i] = head[b];
+                    head[b] = (int)i;
+                }
+            }
+        }
+
         for (size_t j = 0; j < nUnknowns; j++) {
-            double partialDerivative = 0;
-            CALL(getPartialDerivative(S, (ValueReference)unknowns[j], (ValueReference)knowns[i], &partialDerivative));
-            sensitivity[i] += partialDerivative * seed[j];
+            const double s_j = seed[j];
+            if (s_j == 0.0) continue;
+
+            ValueReference vrUnk = (ValueReference)unknowns[j];
+            if (vrUnk < START_VR) {
+                for (size_t i = 0; i < nKnowns; i++) {
+                    double partialDerivative = 0.0;
+                    CALL(getPartialDerivative(S, vrUnk, (ValueReference)knowns[i], &partialDerivative));
+                    sensitivity[i] += partialDerivative * s_j;
+                }
+            } else {
+                size_t idxUnk = (vrUnk - START_VR) / VARS_PER_BALL;
+                if (idxUnk < NUM_BALLS) {
+                    for (int i = head[idxUnk]; i != -1; i = nextKnown[i]) {
+                        double partialDerivative = 0.0;
+                        CALL(getPartialDerivative(S, vrUnk, (ValueReference)knowns[i], &partialDerivative));
+                        sensitivity[i] += partialDerivative * s_j;
+                    }
+                }
+                for (size_t g = nGlobalKnown; g-- > 0; ) {
+                    int i = globalKnown[g];
+                    double partialDerivative = 0.0;
+                    CALL(getPartialDerivative(S, vrUnk, (ValueReference)knowns[i], &partialDerivative));
+                    sensitivity[i] += partialDerivative * s_j;
+                }
+            }
+        }
+    } else {
+        for (size_t j = 0; j < nUnknowns; j++) {
+            const double s_j = seed[j];
+            if (s_j == 0.0) continue;
+
+            ValueReference vrUnk = (ValueReference)unknowns[j];
+            bool isUnkGlobal = (vrUnk < START_VR);
+            size_t idxUnk = isUnkGlobal ? 0 : (vrUnk - START_VR) / VARS_PER_BALL;
+
+            for (size_t i = 0; i < nKnowns; i++) {
+                ValueReference vrKnown = (ValueReference)knowns[i];
+
+                if (!isUnkGlobal && vrKnown >= START_VR) {
+                    if (((vrKnown - START_VR) / VARS_PER_BALL) != idxUnk) continue;
+                }
+
+                double partialDerivative = 0.0;
+                CALL(getPartialDerivative(S, vrUnk, vrKnown, &partialDerivative));
+                sensitivity[i] += partialDerivative * s_j;
+            }
         }
     }
 
@@ -1152,6 +1300,7 @@ fmi3Status fmi3SetTime(fmi3Instance instance, fmi3Float64 time) {
     BEGIN_FUNCTION(SetTime);
 
     S->time = time;
+    S->jacobianEpoch++;
 
     END_FUNCTION();
 }
@@ -1441,6 +1590,8 @@ fmi3Status fmi3DoStep(fmi3Instance instance,
     } else {
         S->nextCommunicationPoint = S->time;
     }
+
+    S->jacobianEpoch++;
 
     END_FUNCTION();
 }
