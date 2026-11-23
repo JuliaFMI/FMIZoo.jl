@@ -7,7 +7,7 @@ set(NUM_BALLS 1 CACHE STRING "Anzahl der Bouncing Balls")
 
 set(START_VR 100)
 
-message(STATUS "--- Konfiguriere FMU für ${NUM_BALLS} Bälle ---")
+message(STATUS "--- Configure FMU for ${NUM_BALLS} balls ---")
 add_compile_definitions(NUM_BALLS=${NUM_BALLS})
 add_compile_definitions(START_VR=${START_VR}) 
 add_compile_definitions(FMI_VERSION=3)
@@ -58,8 +58,9 @@ foreach(i RANGE 1 ${NUM_BALLS})
 
 
     # h (Position)
+    math(EXPR START_H "9 + ${i}")
     string(APPEND XML_MODEL_VARIABLES "    \n")
-    string(APPEND XML_MODEL_VARIABLES "    <Float64 name=\"h${i}\" valueReference=\"${VR_H}\" causality=\"output\" variability=\"continuous\" initial=\"exact\" declaredType=\"Position\" start=\"1\" reinit=\"true\">\n")
+    string(APPEND XML_MODEL_VARIABLES "    <Float64 name=\"h${i}\" valueReference=\"${VR_H}\" causality=\"output\" variability=\"continuous\" initial=\"exact\" declaredType=\"Position\" start=\"${START_H}\" reinit=\"true\">\n")
     string(APPEND XML_MODEL_VARIABLES "       <Alias name=\"h_ft${i}\" description=\"Position in feet\" displayUnit=\"ft\"/>\n")
     string(APPEND XML_MODEL_VARIABLES "    </Float64>\n")
 
@@ -136,6 +137,12 @@ target_compile_definitions(${FMU_NAME} PRIVATE DISABLE_PREFIX)
 
 target_compile_definitions(${FMU_NAME} PRIVATE MODEL_IDENTIFIER="NBouncingBalls")
 
+if(MSVC)
+    target_compile_options(${FMU_NAME} PRIVATE /O2)
+else()
+    target_compile_options(${FMU_NAME} PRIVATE -O3)
+endif()
+
 if(UNIX)
     target_compile_options(${FMU_NAME} PRIVATE -fPIC)
 endif()
@@ -165,11 +172,13 @@ add_custom_command(TARGET ${FMU_NAME} POST_BUILD
     
     COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_BINARY_DIR}/fmi-ls-manifest.xml" "${FMU_STAGING_DIR}/extra/"
     
-    COMMENT "Erstelle FMU Ordnerstruktur (inkl. extra Ordner)..."
+    COMMENT "Create FMU file structure..."
 )
 
 add_custom_command(TARGET ${FMU_NAME} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E tar "cfv" "${CMAKE_CURRENT_BINARY_DIR}/${FINAL_FMU_NAME}.fmu" --format=zip "."
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_SOURCE_DIR}/fmus_bench"
+    COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_BINARY_DIR}/${FINAL_FMU_NAME}.fmu" "${CMAKE_CURRENT_SOURCE_DIR}/fmus_bench/${FINAL_FMU_NAME}_${NUM_BALLS}.fmu"
     WORKING_DIRECTORY "${FMU_STAGING_DIR}"
-    COMMENT "Packe ${FINAL_FMU_NAME}.fmu ..."
+    COMMENT "Zip ${FINAL_FMU_NAME}.fmu and copy to fmus_bench/${FINAL_FMU_NAME}_${NUM_BALLS}.fmu ..."
 )

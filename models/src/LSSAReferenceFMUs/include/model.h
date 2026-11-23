@@ -12,6 +12,10 @@
 
 #include "config.h"
 
+#ifndef NUM_BALLS
+#define NUM_BALLS 1
+#endif
+
 #if FMI_VERSION == 1
 
 #define not_modelError (Instantiated| Initialized | Terminated)
@@ -98,6 +102,37 @@ typedef void (*intermediateUpdateType) (void *instanceEnvironment,
 
 typedef void(*clockUpdateType) (void *instanceEnvironment);
 
+// Split Jacobian cache for each ball with epoch tracking
+// Fixed matrix entries (0.0 / 1.0) are preloaded once in setStartValues.
+typedef struct {
+    // Preloaded fixed matrix: event indicator z with respect to state x = (h, v)
+    double dz_dh;       // 1.0
+    double dz_dv;       // 0.0
+
+    // Preloaded fixed entries: state derivative x. = (der_h, der_v) with respect to state x = (h, v)
+    double dderh_dh;    // 0.0
+    double dderh_dv;    // 1.0
+    double dderv_dh;    // 0.0
+
+    // 1st partial cache: time derivatives (known == vr_time)
+    uint64_t epochTime;
+    double dh_dt;       // b->v
+    double dv_dt;       // g_eff - drag_accel (also for der(h)_dt)
+    double dderv_dt;    // b->k
+
+    // 2nd partial cache: state & parameter derivatives for der(v) (OFF_DER_V)
+    uint64_t epochDerV;
+    double dderv_dk;    // comp->time
+    double dderv_dv;    // -2 * c * |v|
+    double dderv_de;    // drag * v * |v|
+    double dderv_ddrag; // -(1 - e) * v * |v|
+
+    // 3rd partial cache: parameter derivatives for event indicator (OFF_EVENT_G)
+    uint64_t epochEventG;
+    double devg_de;     // -ground_flexibility
+    double devg_dflex;  // 1.0 - b->e
+} BallJacobian;
+
 typedef struct {
 
     double startTime;
@@ -133,8 +168,12 @@ typedef struct {
     bool clocksTicked;
 
     bool isDirtyValues;
+    bool isDirtyJacobian;
+    uint64_t jacobianEpoch;
 
     ModelData modelData;
+
+    BallJacobian ballJacobians[NUM_BALLS];
 
     // internal solver steps
     uint64_t nSteps;
@@ -218,6 +257,13 @@ Status setContinuousStates(ModelInstance *comp, const double x[], size_t nx);
 Status getDerivatives(ModelInstance *comp, double dx[], size_t nx);
 Status getOutputDerivative(ModelInstance *comp, ValueReference valueReference, int order, double *value);
 Status getPartialDerivative(ModelInstance *comp, ValueReference unknown, ValueReference known, double *partialDerivative);
+
+// Targeted cache helpers & special-case functions for JVP/VJP
+void markJacobianDirty(ModelInstance *comp);
+void updateBallDerVCache(ModelInstance *comp, size_t ballIdx);
+bool evalSpecialJVP(ModelInstance *comp, const ValueReference unknowns[], size_t nUnknowns, const ValueReference knowns[], size_t nKnowns, const double seed[], double sensitivity[]);
+bool evalSpecialVJP(ModelInstance *comp, const ValueReference unknowns[], size_t nUnknowns, const ValueReference knowns[], size_t nKnowns, const double seed[], double sensitivity[]);
+
 Status getEventIndicators(ModelInstance *comp, double z[], size_t nz);
 Status eventUpdate(ModelInstance *comp);
 
