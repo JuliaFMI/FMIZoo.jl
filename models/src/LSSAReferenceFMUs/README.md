@@ -28,7 +28,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 --------------------------------------------------------------------------------
 
 Modifications:
-Modified to lssa compatible version of BouncingBall. These modifications are provided under the MIT License (see FMIZoo.jl root).
+Modified to an LS-SA compatible version of BouncingBall. These modifications are provided under the MIT License (see FMIZoo.jl root).
 
 # NBouncingBalls (LS-SA reference FMU)
 

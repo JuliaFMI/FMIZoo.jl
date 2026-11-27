@@ -92,7 +92,7 @@ using FMIImport, OrdinaryDiffEqTsit5
     x0 = FMIZoo.getState(data_train, tStart)
     @test x0 == x0_gt
 
-    # LSSA test
+    # LS-SA test
     for i in (1, 10, 100, 1000)
         path =
             get_model_filename("NBouncingBalls_$(i)", "LSSAReferenceFMUs", "0.1.0", "3.0")
