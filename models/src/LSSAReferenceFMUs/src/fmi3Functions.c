@@ -889,15 +889,16 @@ fmi3Status fmi3GetDirectionalDerivative(fmi3Instance instance,
     fmi3Float64 sensitivity[],
     size_t nSensitivity) {
 
+    BEGIN_FUNCTION(GetDirectionalDerivative);
+
+#ifdef LSSA_DERIVATIVES
+    // sparse: O(nUnknowns + nKnowns), see model.c
+    CALL(getDirectionalDerivative(S, unknowns, nUnknowns, knowns, nKnowns, seed, nSeed, sensitivity, nSensitivity));
+#else
     UNUSED(nSeed);
     UNUSED(nSensitivity);
 
-    BEGIN_FUNCTION(GetDirectionalDerivative);
-
-    // TODO: check value references
-    // TODO: assert nUnknowns == nDeltaOfUnknowns
-    // TODO: assert nKnowns == nDeltaKnowns
-
+    // dense fallback: O(nUnknowns * nKnowns)
     for (size_t i = 0; i < nUnknowns; i++) {
         sensitivity[i] = 0;
         for (size_t j = 0; j < nKnowns; j++) {
@@ -906,6 +907,7 @@ fmi3Status fmi3GetDirectionalDerivative(fmi3Instance instance,
             sensitivity[i] += partialDerivative * seed[j];
         }
     }
+#endif
 
     END_FUNCTION();
 }
@@ -920,13 +922,16 @@ fmi3Status fmi3GetAdjointDerivative(fmi3Instance instance,
     fmi3Float64 sensitivity[],
     size_t nSensitivity) {
 
+    BEGIN_FUNCTION(GetAdjointDerivative);
+
+#ifdef LSSA_DERIVATIVES
+    // sparse: O(nUnknowns + nKnowns), see model.c
+    CALL(getAdjointDerivative(S, unknowns, nUnknowns, knowns, nKnowns, seed, nSeed, sensitivity, nSensitivity));
+#else
     UNUSED(nSeed);
     UNUSED(nSensitivity);
 
-    BEGIN_FUNCTION(GetAdjointDerivative);
-
-    // TODO: check value references
-
+    // dense fallback: O(nUnknowns * nKnowns)
     for (size_t i = 0; i < nKnowns; i++) {
         sensitivity[i] = 0;
         for (size_t j = 0; j < nUnknowns; j++) {
@@ -935,6 +940,7 @@ fmi3Status fmi3GetAdjointDerivative(fmi3Instance instance,
             sensitivity[i] += partialDerivative * seed[j];
         }
     }
+#endif
 
     END_FUNCTION();
 }

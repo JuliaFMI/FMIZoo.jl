@@ -98,5 +98,10 @@ using FMIImport, OrdinaryDiffEqTsit5
             get_model_filename("NBouncingBalls_$(i)", "LSSAReferenceFMUs", "0.1.0", "3.0")
         @test isfile(path)
     end
+    for i in (1, 3, 10, 30, 100, 300, 1000)
+        path =
+            get_model_filename("NBouncingBalls_$(i)", "LSSAReferenceFMUs", "0.2.0", "3.0")
+        @test isfile(path)
+    end
 
 end

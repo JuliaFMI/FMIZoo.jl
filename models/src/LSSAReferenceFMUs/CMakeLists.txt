@@ -1,9 +1,23 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.15)
 project(NBouncingBalls LANGUAGES C)
+
+# optimized build by default (benchmarks!)
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+# MSVC: link the C runtime statically, so the FMU does not depend on the VC++ redistributable
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 include_directories("${CMAKE_CURRENT_SOURCE_DIR}/include")
 
 set(NUM_BALLS 1 CACHE STRING "Anzahl der Bouncing Balls")
+
+# LS-SA: cache derivative plans (value reference patterns) per instance; OFF analyses every call
+option(LSSA_PLAN_CACHE "Cache LS-SA derivative plans" ON)
+if(LSSA_PLAN_CACHE)
+    add_compile_definitions(LSSA_PLAN_CACHE)
+endif()
 
 set(START_VR 100)
 
@@ -82,17 +96,26 @@ foreach(i RANGE 1 ${NUM_BALLS})
     string(APPEND XML_MODEL_VARIABLES "    <Float64 name=\"event_indicator_ground${i}\" valueReference=\"${VR_EVENT}\" causality=\"local\" variability=\"continuous\"/>\n")
 
     # --- XML_MODEL_STRUCTURE
-    
-    string(APPEND STRUC_OUTPUTS "    <Output valueReference=\"${VR_H}\"/>\n")
-    string(APPEND STRUC_OUTPUTS "    <Output valueReference=\"${VR_V}\"/>\n")
+    # `dependencies` (FMI 3.0 knowns: states, inputs, parameters, independent variable), from the equations in
+    # src/model.c; checked against the analytic Jacobian by fmi-ls-sa/benchmarks/test_fmu.jl:
+    #   der(h) = v
+    #   der(v) = g + k * time - drag_coefficient * (1 - e) * v * |v|
+    #   z      = h + ground_flexibility * (1 - e)            (event indicator)
+    # InitialUnknowns stay without `dependencies` (= may depend on all knowns).
+    set(VR_TIME 0)
+    set(VR_G 1)
+    set(VR_GROUND_FLEXIBILITY 3)
 
-    string(APPEND STRUC_DERIVATIVES "    <ContinuousStateDerivative valueReference=\"${VR_DER_H}\"/>\n")
-    string(APPEND STRUC_DERIVATIVES "    <ContinuousStateDerivative valueReference=\"${VR_DER_V}\"/>\n")
+    string(APPEND STRUC_OUTPUTS "    <Output valueReference=\"${VR_H}\" dependencies=\"${VR_H}\"/>\n")
+    string(APPEND STRUC_OUTPUTS "    <Output valueReference=\"${VR_V}\" dependencies=\"${VR_V}\"/>\n")
+
+    string(APPEND STRUC_DERIVATIVES "    <ContinuousStateDerivative valueReference=\"${VR_DER_H}\" dependencies=\"${VR_V}\"/>\n")
+    string(APPEND STRUC_DERIVATIVES "    <ContinuousStateDerivative valueReference=\"${VR_DER_V}\" dependencies=\"${VR_TIME} ${VR_G} ${VR_V} ${VR_E} ${VR_K} ${VR_DRAG}\"/>\n")
 
     string(APPEND STRUC_INITIALS "    <InitialUnknown valueReference=\"${VR_DER_H}\"/>\n")
     string(APPEND STRUC_INITIALS "    <InitialUnknown valueReference=\"${VR_DER_V}\"/>\n")
 
-    string(APPEND STRUC_EVENTS "    <EventIndicator valueReference=\"${VR_EVENT}\"/>\n")
+    string(APPEND STRUC_EVENTS "    <EventIndicator valueReference=\"${VR_EVENT}\" dependencies=\"${VR_GROUND_FLEXIBILITY} ${VR_H} ${VR_E}\"/>\n")
 
 
     string(APPEND LS_MODEL_VARIABLES "        \n")
@@ -113,14 +136,14 @@ set(XML_MODEL_STRUCTURE "${STRUC_OUTPUTS}${STRUC_DERIVATIVES}${STRUC_INITIALS}${
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/templates/modelDescription.xml.in"
     "${CMAKE_CURRENT_BINARY_DIR}/modelDescription.xml"
-    @ONLY
+    @ONLY NEWLINE_STYLE UNIX
 )
 
 # fmi-ls-manifest.xml
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/extra/fmi-ls-manifest.xml.in"
     "${CMAKE_CURRENT_BINARY_DIR}/fmi-ls-manifest.xml"
-    @ONLY
+    @ONLY NEWLINE_STYLE UNIX
 )
 
 set(FINAL_FMU_NAME "NBouncingBalls")
@@ -128,7 +151,7 @@ add_library(${FMU_NAME} SHARED ${SOURCE_FILES})
 
 set_target_properties(${FMU_NAME} PROPERTIES PREFIX "")
 
-if(WIN32)
+if(MINGW)
     target_link_options(${FMU_NAME} PRIVATE "-Wl,--export-all-symbols")
 endif()
 

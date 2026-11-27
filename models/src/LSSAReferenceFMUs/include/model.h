@@ -153,6 +153,11 @@ typedef struct {
     double* x;
     double* dx;
 
+    // LS-SA: derivative plans (cached value reference patterns) and scratch buffers, see model.c.
+    // Heap allocated on purpose: NOT part of the FMU state, so it does not inflate
+    // fmi3GetFMUState / fmi3SetFMUState (and is not affected by them).
+    void* lssa;
+
 } ModelInstance;
 
 ModelInstance *createModelInstance(
@@ -220,6 +225,21 @@ Status getOutputDerivative(ModelInstance *comp, ValueReference valueReference, i
 Status getPartialDerivative(ModelInstance *comp, ValueReference unknown, ValueReference known, double *partialDerivative);
 Status getEventIndicators(ModelInstance *comp, double z[], size_t nz);
 Status eventUpdate(ModelInstance *comp);
+
+// LS-SA
+Status allocateModelBuffers(ModelInstance *comp);
+void freeModelBuffers(ModelInstance *comp);
+double nextEventPeriod(ModelInstance *comp, double sum_h, bool *clamped);
+Status getDirectionalDerivative(ModelInstance *comp,
+    const ValueReference unknowns[], size_t nUnknowns,
+    const ValueReference knowns[], size_t nKnowns,
+    const double seed[], size_t nSeed,
+    double sensitivity[], size_t nSensitivity);
+Status getAdjointDerivative(ModelInstance *comp,
+    const ValueReference unknowns[], size_t nUnknowns,
+    const ValueReference knowns[], size_t nKnowns,
+    const double seed[], size_t nSeed,
+    double sensitivity[], size_t nSensitivity);
 
 bool isClose(double a, double b);
 bool invalidNumber(ModelInstance *comp, const char *f, const char *arg, size_t actual, size_t expected);
