@@ -104,6 +104,12 @@ ModelInstance *createModelInstance(
 
     setStartValues(comp);
 
+    if (allocateModelBuffers(comp) != OK) {
+        logError(comp, "Out of memory.");
+        freeModelInstance(comp);
+        return NULL;
+    }
+
     comp->isDirtyValues = true;
 
     return comp;
@@ -124,6 +130,8 @@ void freeModelInstance(ModelInstance *comp) {
     if (comp->x) free(comp->x);
 
     if (comp->dx) free(comp->dx);
+
+    freeModelBuffers(comp);
 
     free(comp);
 }
@@ -176,10 +184,18 @@ Status configurate(ModelInstance* comp) {
 
     if (M(base_event_period) > 0)
     {
-        comp->nextEventTimeDefined = true;
-        comp->nextEventTime = comp->startTime + M(current_event_period);
+        // same (state dependent) scheduling rule as for all later time events, see eventUpdate
+        double sum_h = 0.0;
+        for (int i = 0; i < NUM_BALLS; i++) {
+            sum_h += comp->modelData.balls[i].h;
+        }
+        bool clamped = false;
+        const double period = nextEventPeriod(comp, sum_h, &clamped);
 
-        logEvent(comp, "First time event scheduled for t=%.3f (using initial period of %.3fs).", comp->nextEventTime, M(current_event_period));
+        comp->nextEventTimeDefined = true;
+        comp->nextEventTime = comp->startTime + period;
+
+        logEvent(comp, "First time event scheduled for t=%.3f (period %.3fs).", comp->nextEventTime, period);
     }
 
     return OK;
@@ -569,7 +585,10 @@ Status getPartialDerivative(ModelInstance *comp, ValueReference unknown, ValueRe
 
 Status getFMUState(ModelInstance* comp, void** FMUState) {
 
-    CALL(s_reallocate(comp, FMUState, sizeof(ModelInstance)));
+    // an existing FMU state passed by the importer is reused (always of size sizeof(ModelInstance))
+    if (*FMUState == NULL) {
+        CALL(s_reallocate(comp, FMUState, sizeof(ModelInstance)));
+    }
 
     memcpy(*FMUState, comp, sizeof(ModelInstance));
 
@@ -620,16 +639,18 @@ Status setFMUState(ModelInstance* comp, void* FMUState) {
     comp->eventModeUsed = s->eventModeUsed;
     comp->nextCommunicationPoint = s->nextCommunicationPoint;
 
-    if (comp->nx > 0) {
+    // solver buffers: the FMU state is a shallow copy, so for states of this instance the pointers are
+    // identical and copying would only copy the buffers onto themselves (skipped)
+    if (comp->nx > 0 && comp->x != s->x) {
         memcpy(comp->x, s->x, s->nx * sizeof(double));
+    }
+    if (comp->nx > 0 && comp->dx != s->dx) {
         memcpy(comp->dx, s->dx, s->nx * sizeof(double));
     }
 
-    if (comp->nz > 0) {
+    if (comp->nz > 0 && comp->z != s->z) {
         memcpy(comp->z, s->z, s->nz * sizeof(double));
     }
-
-    comp->nSteps = s->nSteps;
 
     return OK;
 }

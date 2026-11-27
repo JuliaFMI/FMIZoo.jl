@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <fmiModelDescription
   fmiVersion="3.0"
-  modelName="NBouncingBalls"
-  description="This model calculates the trajectory, over time, of N balls dropped from a height."
+  modelName="@MODEL_NAME@"
+  description="@MODEL_DESCRIPTION@"
   generationTool="Reference FMUs (development build)"
   instantiationToken="{1AE5E10D-9521-4DE3-80B9-D0EAAA7D5AF1}">
 
@@ -10,7 +10,8 @@
     modelIdentifier="NBouncingBalls"
     canGetAndSetFMUState="true"
     canSerializeFMUState="true"
-    providesDirectionalDerivatives="true"/>
+    providesDirectionalDerivatives="true"
+    providesAdjointDerivatives="true"/>
 
   <CoSimulation
     modelIdentifier="NBouncingBalls"
@@ -22,7 +23,8 @@
     canReturnEarlyAfterIntermediateUpdate="true"
     fixedInternalStepSize="1e-3"
     hasEventMode="true"
-    providesDirectionalDerivatives="true"/>
+    providesDirectionalDerivatives="true"
+    providesAdjointDerivatives="true"/>
 
   <UnitDefinitions>
     <Unit name="m">

@@ -92,10 +92,24 @@ using FMIImport, OrdinaryDiffEqTsit5
     x0 = FMIZoo.getState(data_train, tStart)
     @test x0 == x0_gt
 
-    # LSSA test
+    # LS-SA test
     for i in (1, 10, 100, 1000)
         path =
             get_model_filename("NBouncingBalls_$(i)", "LSSAReferenceFMUs", "0.1.0", "3.0")
+        @test isfile(path)
+    end
+    for i in (1, 3, 10, 30, 100, 300, 1000)
+        path =
+            get_model_filename("NBouncingBalls_$(i)", "LSSAReferenceFMUs", "0.2.0", "3.0")
+        @test isfile(path)
+    end
+    for i in (3, 10, 30, 100, 300, 1000), k in (1, 8, i - 1)   # coupled variant, K capped at N - 1
+        path = get_model_filename(
+            "NCoupledBouncingBalls_$(i)_K$(min(k, i - 1))",
+            "LSSAReferenceFMUs",
+            "0.2.0",
+            "3.0",
+        )
         @test isfile(path)
     end
 
