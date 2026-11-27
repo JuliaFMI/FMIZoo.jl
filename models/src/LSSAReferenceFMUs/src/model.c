@@ -19,6 +19,12 @@
  *       nextEventTime := time + base_event_period * (1 + EVENT_HEIGHT_COUPLING * mean(pre(h)))
  *   state event (h <= ground_level && v < 0):     h := ground_level, v := -e*v (v := 0 if |v| < v_min)
  *
+ * Coupled variant (NUM_NEIGHBORS = K > 0, "NCoupledBouncingBalls", see config.h): der(v_i) additionally contains
+ * the force of hardening springs with dampers to the K nearest neighbors on each side (stiffness (c_i + c_j)/2,
+ * c_i tunable), and every impact passes a share of its velocity change to the neighbors (after all bounces of the
+ * event iteration). The springs are nonlinear, so the coupling costs O(N*K) per evaluation for every method (no
+ * cheaper summation exists); the impact transfer costs O(impacts * K).
+ *
  * LS-SA:
  *   - fmi3GetDirectionalDerivative / fmi3GetAdjointDerivative are sparse, O(nUnknowns + nKnowns)
  *     (plus O(NUM_BALLS) for the inherently dense rows/columns of nextEventTime, time, g, ground_flexibility),
@@ -51,6 +57,38 @@ static inline double derV(ModelInstance* comp, const BallData* b) {
 
 static inline double groundLevel(ModelInstance* comp, const BallData* b) {
     return -M(ground_flexibility) * (1.0 - b->e);
+}
+
+#if NUM_NEIGHBORS > 0
+#define INV_K (1.0 / NUM_NEIGHBORS)
+
+static inline double phi(double x)  { return x + SPRING_CUBIC * x * x * x; }
+static inline double dphi(double x) { return 1.0 + 3.0 * SPRING_CUBIC * x * x; }
+
+// neighbors of ball i: [nbLo(i), nbHi(i)) without i
+static inline size_t nbLo(size_t i) { return i > NUM_NEIGHBORS ? i - NUM_NEIGHBORS : 0; }
+static inline size_t nbHi(size_t i) { return i + NUM_NEIGHBORS + 1 < NUM_BALLS ? i + NUM_NEIGHBORS + 1 : NUM_BALLS; }
+
+// coupling force on ball i, O(K)
+static double couplingForce(const BallData* balls, size_t i) {
+    const BallData* bi = &balls[i];
+    double f = 0.0;
+    for (size_t j = nbLo(i); j < nbHi(i); j++) {
+        if (j == i) continue;
+        const BallData* bj = &balls[j];
+        f += 0.5 * (bi->c + bj->c) * phi(bj->h - bi->h) + COUPLING_DAMPING * (bj->v - bi->v);
+    }
+    return f * INV_K;
+}
+#endif
+
+// der(v) of ball i (including the coupling force)
+static inline double derVBall(ModelInstance* comp, size_t i) {
+#if NUM_NEIGHBORS > 0
+    return derV(comp, &comp->modelData.balls[i]) + couplingForce(comp->modelData.balls, i);
+#else
+    return derV(comp, &comp->modelData.balls[i]);
+#endif
 }
 
 double nextEventPeriod(ModelInstance* comp, double sum_h, bool* clamped) {
@@ -103,7 +141,13 @@ void setStartValues(ModelInstance *comp) {
         b->pre_h = b->h;
         b->pre_v = b->v;
         b->eventKind = EVENT_NONE;
+#if NUM_NEIGHBORS > 0
+        b->c = 1.0;
+#endif
     }
+#if NUM_NEIGHBORS > 0
+    M(nImpacted) = 0;
+#endif
 }
 
 Status calculateValues(ModelInstance *comp) {
@@ -166,11 +210,16 @@ Status getFloat64(ModelInstance* comp, ValueReference vr, double values[], size_
             values[(*index)++] = b->v;
             return OK;
         case OFF_DER_V:
-            values[(*index)++] = derV(comp, b);
+            values[(*index)++] = derVBall(comp, ballIdx);
             return OK;
         case OFF_E:
             values[(*index)++] = b->e;
             return OK;
+#if NUM_NEIGHBORS > 0
+        case OFF_C:
+            values[(*index)++] = b->c;
+            return OK;
+#endif
         case OFF_K:
             values[(*index)++] = b->k;
             return OK;
@@ -281,6 +330,13 @@ Status setFloat64(ModelInstance* comp, ValueReference vr, double value) {
             b->drag_coefficient = value;
             return OK;
 
+#if NUM_NEIGHBORS > 0
+        case OFF_C:
+            if (!tunableSettable(comp, vr)) return Error;
+            b->c = value;
+            return OK;
+#endif
+
         default:
             logError(comp, "Unexpected value reference: %u.", vr);
             return Error;
@@ -311,7 +367,7 @@ Status getOutputDerivative(ModelInstance *comp, ValueReference valueReference, i
         *value = b->v;
         return OK;
     case OFF_V:
-        *value = derV(comp, b);
+        *value = derVBall(comp, ballIdx);
         return OK;
     default:
         logError(comp, "The output derivative for value reference %u is not available.", valueReference);
@@ -407,6 +463,19 @@ Status getDerivatives(ModelInstance *comp, double dx[], size_t nx) {
         dx[2 * i]     = b->v;
         dx[2 * i + 1] = derV(comp, b);
     }
+#if NUM_NEIGHBORS > 0
+    // coupling forces: every spring / damper once (the force on j is the negative of the one on i, phi is odd)
+    const BallData* balls = comp->modelData.balls;
+    for (size_t i = 0; i < NUM_BALLS; i++) {
+        const BallData* bi = &balls[i];
+        for (size_t j = i + 1; j < nbHi(i); j++) {
+            const BallData* bj = &balls[j];
+            const double f = (0.5 * (bi->c + bj->c) * phi(bj->h - bi->h) + COUPLING_DAMPING * (bj->v - bi->v)) * INV_K;
+            dx[2 * i + 1] += f;
+            dx[2 * j + 1] -= f;
+        }
+    }
+#endif
     return OK;
 }
 
@@ -433,6 +502,9 @@ Status eventUpdate(ModelInstance *comp) {
     const bool timeEvent = comp->nextEventTimeDefined && comp->time >= comp->nextEventTime;
     const double gf = M(ground_flexibility);
     double sum_pre_h = 0.0;
+#if NUM_NEIGHBORS > 0
+    M(nImpacted) = 0;
+#endif
 
     for (int i = 0; i < NUM_BALLS; i++) {
         BallData* b = &comp->modelData.balls[i];
@@ -466,10 +538,30 @@ Status eventUpdate(ModelInstance *comp) {
             }
 
             comp->valuesOfContinuousStatesChanged = true;
+#if NUM_NEIGHBORS > 0
+            M(impacted)[M(nImpacted)++] = (uint32_t)i;
+#endif
         }
     }
 
     M(lastEventKick) = timeEvent;
+
+#if NUM_NEIGHBORS > 0
+    // impact transfer, after all bounces of this event iteration: the velocity change of an impacted ball,
+    // dv = v (after bounce / clamp) - v (before, incl. kick), is computed from pre(v), so that transfers between
+    // impacted neighbors do not depend on the order. dv > 0 (upwards), so no further bounce can be caused.
+    const double kick = timeEvent ? M(event_kick_velocity) : 0.0;
+    for (uint32_t q = 0; q < M(nImpacted); q++) {
+        const size_t i = M(impacted)[q];
+        const BallData* bi = &comp->modelData.balls[i];
+        const double vBefore = bi->pre_v + kick;
+        const double dv = (bi->eventKind == EVENT_BOUNCE ? -bi->e * vBefore : 0.0) - vBefore;
+        const double share = IMPACT_TRANSFER * INV_K * dv;
+        for (size_t j = nbLo(i); j < nbHi(i); j++) {
+            if (j != i) comp->modelData.balls[j].v += share;
+        }
+    }
+#endif
 
     if (timeEvent) {
         if (M(base_event_period) > 0) {
@@ -851,81 +943,7 @@ static Status getPlan(ModelInstance* comp, const char* f,
     return OK;
 }
 
-/* ---- generic path (arbitrary lists, struct-of-arrays scratch) ---------------------------------- */
-
-static void jvpGeneric(ModelInstance* comp, const ValueReference unknowns[], size_t nUnknowns,
-                       const ValueReference knowns[], size_t nKnowns,
-                       const double seed[], double sensitivity[], bool eventMode) {
-    double* s = ((LSSAData*)comp->lssa)->scratch;
-
-    for (size_t j = 0; j < nKnowns; j++) {
-        s[scratchIndex(knowns[j])] += seed[j];
-    }
-
-    for (size_t i = 0; i < nUnknowns; i++) {
-        const ValueReference vr = unknowns[i];
-        if (vr < START_VR) {
-            double d = jvpGlobalSelf(comp, vr, s);
-            if (vr == vr_nextEventTime && M(dTn_dpreh) != 0.0) {
-                const double* sp = s + NUM_GLOBAL_VRS + (size_t)OFF_PRE_H * NUM_BALLS;
-                double acc = 0.0;
-                for (size_t k = 0; k < NUM_BALLS; k++) {
-                    acc += sp[k];
-                }
-                d += M(dTn_dpreh) * acc;
-            }
-            sensitivity[i] = d;
-        } else {
-            const size_t offset = vr - START_VR;
-            const size_t ball = offset / VARS_PER_BALL;
-            sensitivity[i] = jvpLocal(comp, &comp->modelData.balls[ball], offset % VARS_PER_BALL,
-                                      s + NUM_GLOBAL_VRS + ball, NUM_BALLS, s, eventMode);
-        }
-    }
-
-    for (size_t j = 0; j < nKnowns; j++) {
-        s[scratchIndex(knowns[j])] = 0.0;
-    }
-}
-
-static void vjpGeneric(ModelInstance* comp, const ValueReference unknowns[], size_t nUnknowns,
-                       const ValueReference knowns[], size_t nKnowns,
-                       const double seed[], double sensitivity[], bool eventMode) {
-    double* w = ((LSSAData*)comp->lssa)->scratch;
-
-    for (size_t i = 0; i < nUnknowns; i++) {
-        w[scratchIndex(unknowns[i])] += seed[i];
-    }
-
-    for (size_t j = 0; j < nKnowns; j++) {
-        const ValueReference vr = knowns[j];
-        if (vr < START_VR) {
-            double d = vjpGlobalSelf(comp, vr, w);
-            if (globalHasBallTerms(vr)) {
-                for (size_t k = 0; k < NUM_BALLS; k++) {
-                    d += vjpGlobalFromBall(comp, &comp->modelData.balls[k], vr, w + NUM_GLOBAL_VRS + k, NUM_BALLS, eventMode);
-                }
-            }
-            sensitivity[j] = d;
-        } else {
-            const size_t offset = vr - START_VR;
-            const size_t ball = offset / VARS_PER_BALL;
-            sensitivity[j] = vjpLocal(comp, &comp->modelData.balls[ball], offset % VARS_PER_BALL,
-                                      w + NUM_GLOBAL_VRS + ball, NUM_BALLS, w, eventMode);
-        }
-    }
-
-    for (size_t i = 0; i < nUnknowns; i++) {
-        w[scratchIndex(unknowns[i])] = 0.0;
-    }
-}
-
-/* ---- fast paths (block structured lists): type-major streaming kernels -------------------------
- * One tight loop over the balls per variable type of the output list (the switch is outside the loop),
- * the seeds are read in place through per-type column pointers / strides (absent types: a zero with
- * stride 0). Ball ranges of unknowns and knowns may differ: the output range is split into at most
- * three segments (without / with / without seeds), so the loops contain no membership tests.
- * The formulas are the same as in jvpLocal / vjpLocal (checked by the tests: fast == generic path). */
+/* ---- column views (shared by the generic path and the fast paths) ------------------------------ */
 
 static const double ZERO = 0.0;
 
@@ -951,6 +969,376 @@ static void columnsFromBlock(const ListPattern* p, const double seed[], Columns*
     }
     c->ball0 = p->ball0;
 }
+
+#if NUM_NEIGHBORS > 0
+/* ---- coupled variant: coupling forces and impact transfer -----------------------------------------
+ * Added to the per-ball formulas by both paths. The seeds (JVP) / weights (VJP) of other balls are read
+ * through a view; absent variable types read zero and are skipped as a whole. */
+
+typedef struct {
+    Columns c;       // per variable type: column pointer / stride (absent: ZERO, stride 0)
+    size_t lo, hi;   // balls [lo, hi) with seeds
+} View;
+
+static inline double viewAt(const View* v, size_t t, size_t j) {
+    return (j >= v->lo && j < v->hi) ? v->c.col[t][(j - v->c.ball0) * v->c.stride[t]] : 0.0;
+}
+
+static inline bool viewHas(const View* v, size_t t) {
+    return v->c.col[t] != &ZERO;
+}
+
+static void viewZero(View* v) {
+    columnsZero(&v->c);
+    v->lo = 0;
+    v->hi = 0;
+}
+
+static void viewFromBlock(const ListPattern* p, const double seed[], View* v) {
+    columnsFromBlock(p, seed, &v->c);
+    v->lo = p->ball0;
+    v->hi = p->ball0 + p->nBalls;
+}
+
+// generic path: struct-of-arrays scratch, only the variable types that occur in the list
+static void viewFromScratch(const double* s, const ValueReference vrs[], size_t n, View* v) {
+    columnsZero(&v->c);
+    for (size_t k = 0; k < n; k++) {
+        if (vrs[k] < START_VR) continue;
+        const size_t t = (vrs[k] - START_VR) % VARS_PER_BALL;
+        v->c.col[t] = s + NUM_GLOBAL_VRS + t * NUM_BALLS;
+        v->c.stride[t] = 1;
+    }
+    v->lo = 0;
+    v->hi = NUM_BALLS;
+}
+
+// impact of ball b in the last event iteration: dv = v+ (own branch) - v-, v- = pre(v) (+ kick)
+#define DDV_PREV(b) ((b)->eventKind == EVENT_BOUNCE ? -(1.0 + (b)->e) : -1.0)  // d dv / d pre(v)
+#define DDV_E(b)    ((b)->eventKind == EVENT_BOUNCE ? -((b)->pre_v + (M(lastEventKick) ? M(event_kick_velocity) : 0.0)) : 0.0)  // d dv / d e
+
+// d (coupling force on ball i) * seed, seeds of h, v, c of all balls in S; O(K)
+static double jvpCouplingDerV(const BallData* balls, size_t i, const View* S) {
+    const bool sh = viewHas(S, OFF_H), sv = viewHas(S, OFF_V), sc = viewHas(S, OFF_C);
+    if (!(sh || sv || sc)) return 0.0;
+    const BallData* bi = &balls[i];
+    double d = 0.0, selfH = 0.0, selfC = 0.0;
+    size_t n = 0;
+    for (size_t j = nbLo(i); j < nbHi(i); j++) {
+        if (j == i) continue;
+        const BallData* bj = &balls[j];
+        const double dh = bj->h - bi->h;
+        n++;
+        if (sh) {
+            const double kd = 0.5 * (bi->c + bj->c) * dphi(dh);
+            d += kd * viewAt(S, OFF_H, j);
+            selfH += kd;
+        }
+        if (sc) {
+            const double p = 0.5 * phi(dh);
+            d += p * viewAt(S, OFF_C, j);
+            selfC += p;
+        }
+        if (sv) d += COUPLING_DAMPING * viewAt(S, OFF_V, j);
+    }
+    if (sh) d -= selfH * viewAt(S, OFF_H, i);
+    if (sc) d += selfC * viewAt(S, OFF_C, i);
+    if (sv) d -= COUPLING_DAMPING * (double)n * viewAt(S, OFF_V, i);
+    return d * INV_K;
+}
+
+// weights of der(v) of all balls in W -> adjoint of the coupling forces w.r.t. h_j, v_j or c_j; O(K)
+// (pairwise springs: phi' is even and phi odd, so the terms of F_i and F_j combine to (w_i - w_j))
+static double vjpCoupling(const BallData* balls, size_t t, size_t j, const View* W) {
+    const BallData* bj = &balls[j];
+    const double wj = viewAt(W, OFF_DER_V, j);
+    double d = 0.0;
+    switch (t) {
+        case OFF_H:
+            for (size_t i = nbLo(j); i < nbHi(j); i++) {
+                if (i == j) continue;
+                d += 0.5 * (bj->c + balls[i].c) * dphi(bj->h - balls[i].h) * (viewAt(W, OFF_DER_V, i) - wj);
+            }
+            break;
+        case OFF_V:
+            for (size_t i = nbLo(j); i < nbHi(j); i++) {
+                if (i == j) continue;
+                d += COUPLING_DAMPING * (viewAt(W, OFF_DER_V, i) - wj);
+            }
+            break;
+        case OFF_C:
+            for (size_t i = nbLo(j); i < nbHi(j); i++) {
+                if (i == j) continue;
+                d += 0.5 * phi(bj->h - balls[i].h) * (viewAt(W, OFF_DER_V, i) - wj);
+            }
+            break;
+        default:
+            return 0.0;
+    }
+    return d * INV_K;
+}
+
+// impact transfer into v+ of ball j (unknown), seeds of pre(v), e of the impacted balls in S; O(impacts)
+static double jvpTransferV(ModelInstance* comp, size_t j, const View* S, bool eventMode) {
+    if (M(nImpacted) == 0) return 0.0;
+    const bool spv = viewHas(S, OFF_PRE_V), se = eventMode && viewHas(S, OFF_E);
+    if (!(spv || se)) return 0.0;
+    double d = 0.0;
+    for (uint32_t q = 0; q < M(nImpacted); q++) {
+        const size_t i = M(impacted)[q];
+        if (i == j || i < nbLo(j) || i >= nbHi(j)) continue;
+        const BallData* b = &comp->modelData.balls[i];
+        if (spv) d += DDV_PREV(b) * viewAt(S, OFF_PRE_V, i);
+        if (se) d += DDV_E(b) * viewAt(S, OFF_E, i);
+    }
+    return d * IMPACT_TRANSFER * INV_K;
+}
+
+// weights of v+ of all balls in W -> adjoint of the impact transfer w.r.t. pre(v_i) or e_i (impacted ball i); O(K)
+static double vjpTransfer(ModelInstance* comp, size_t t, size_t i, const View* W, bool eventMode) {
+    const BallData* b = &comp->modelData.balls[i];
+    if (b->eventKind == EVENT_NONE || !viewHas(W, OFF_V)) return 0.0;
+    double f;
+    if (t == OFF_PRE_V) {
+        f = DDV_PREV(b);
+    } else if (t == OFF_E && eventMode) {
+        f = DDV_E(b);
+    } else {
+        return 0.0;
+    }
+    if (f == 0.0) return 0.0;
+    double sw = 0.0;
+    for (size_t j = nbLo(i); j < nbHi(i); j++) {
+        if (j != i) sw += viewAt(W, OFF_V, j);
+    }
+    return f * sw * IMPACT_TRANSFER * INV_K;
+}
+
+// fast paths: the coupling forces spring by spring (pairs i < j), each contributing to both balls, like
+// getDerivatives evaluates them: one phi / phi' per spring instead of two (the per-ball formulas above, used by the
+// generic path, evaluate every spring from both sides). The pair term of F_i is
+//   f_ij = (c_i + c_j)/2 * phi(h_j - h_i) + COUPLING_DAMPING * (v_j - v_i),   and F_j contains -f_ij.
+
+// JVP: der(v) of balls [u0, u1) -> out[(i - u0) * m + s], seeds of h, v, c in S
+static void jvpCouplingPairs(const BallData* balls, size_t u0, size_t u1, const View* S, double* out, size_t m, size_t s) {
+    const bool sh = viewHas(S, OFF_H), sv = viewHas(S, OFF_V), sc = viewHas(S, OFF_C);
+    if (!(sh || sv || sc)) return;
+    const size_t i0 = u0 > NUM_NEIGHBORS ? u0 - NUM_NEIGHBORS : 0;
+    for (size_t i = i0; i < u1; i++) {
+        const BallData* bi = &balls[i];
+        const bool own = i >= u0;  // der(v_i) is an output
+        const double shi = sh ? viewAt(S, OFF_H, i) : 0.0;
+        const double svi = sv ? viewAt(S, OFF_V, i) : 0.0;
+        const double sci = sc ? viewAt(S, OFF_C, i) : 0.0;
+        double acc = 0.0;
+        const size_t j1 = own || nbHi(i) < u1 ? nbHi(i) : u1;  // i outside: only pairs reaching into the outputs
+        for (size_t j = own ? i + 1 : u0; j < j1; j++) {
+            const BallData* bj = &balls[j];
+            const double dh = bj->h - bi->h;
+            double t = 0.0;
+            if (sh) t += 0.5 * (bi->c + bj->c) * dphi(dh) * (viewAt(S, OFF_H, j) - shi);
+            if (sc) t += 0.5 * phi(dh) * (viewAt(S, OFF_C, j) + sci);
+            if (sv) t += COUPLING_DAMPING * (viewAt(S, OFF_V, j) - svi);
+            acc += t;
+            if (j < u1) out[(j - u0) * m + s] -= t * INV_K;
+        }
+        if (own) out[(i - u0) * m + s] += acc * INV_K;
+    }
+}
+
+// VJP: weights of der(v) in W -> knowns h, v, c (slots sH, sV, sC of the block K, -1: absent) of balls [k0, k1)
+static void vjpCouplingPairs(const BallData* balls, const ListPattern* K, const View* W, double* out) {
+    int sH = -1, sV = -1, sC = -1;
+    for (size_t s = 0; s < K->m; s++) {
+        if (K->types[s] == OFF_H) sH = (int)s;
+        if (K->types[s] == OFF_V) sV = (int)s;
+        if (K->types[s] == OFF_C) sC = (int)s;
+    }
+    if (sH < 0 && sV < 0 && sC < 0) return;
+    const size_t k0 = K->ball0, k1 = K->ball0 + K->nBalls, m = K->m;
+    const size_t i0 = k0 > NUM_NEIGHBORS ? k0 - NUM_NEIGHBORS : 0;
+    for (size_t i = i0; i < k1; i++) {
+        const BallData* bi = &balls[i];
+        const bool own = i >= k0;  // h_i, v_i, c_i are outputs
+        const double wi = viewAt(W, OFF_DER_V, i);
+        double aH = 0.0, aV = 0.0, aC = 0.0;
+        const size_t j1 = own || nbHi(i) < k1 ? nbHi(i) : k1;  // i outside: only pairs reaching into the outputs
+        for (size_t j = own ? i + 1 : k0; j < j1; j++) {
+            const BallData* bj = &balls[j];
+            const double dw = wi - viewAt(W, OFF_DER_V, j);  // f_ij enters F_i (+) and F_j (-)
+            const double dh = bj->h - bi->h;
+            double* oj = out + (j - k0) * m;
+            const bool outj = j < k1;
+            if (sH >= 0) {
+                const double g = 0.5 * (bi->c + bj->c) * dphi(dh) * dw;
+                aH -= g;
+                if (outj) oj[sH] += g * INV_K;
+            }
+            if (sC >= 0) {
+                const double g = 0.5 * phi(dh) * dw;
+                aC += g;
+                if (outj) oj[sC] += g * INV_K;
+            }
+            if (sV >= 0) {
+                const double g = COUPLING_DAMPING * dw;
+                aV -= g;
+                if (outj) oj[sV] += g * INV_K;
+            }
+        }
+        if (own) {
+            double* oi = out + (i - k0) * m;
+            if (sH >= 0) oi[sH] += aH * INV_K;
+            if (sC >= 0) oi[sC] += aC * INV_K;
+            if (sV >= 0) oi[sV] += aV * INV_K;
+        }
+    }
+}
+
+// fast paths: add the coupling / transfer terms to block structured outputs
+static void jvpCouplingBlock(ModelInstance* comp, const ListPattern* U, const View* S, bool eventMode, double* out) {
+    const BallData* balls = comp->modelData.balls;
+    const size_t u0 = U->ball0, u1 = U->ball0 + U->nBalls, m = U->m;
+    const bool ct = viewHas(S, OFF_H) || viewHas(S, OFF_V) || viewHas(S, OFF_C);
+    const bool tr = M(nImpacted) > 0 && (viewHas(S, OFF_PRE_V) || (eventMode && viewHas(S, OFF_E)));
+    for (size_t s = 0; s < m; s++) {
+        const size_t t = (size_t)U->types[s];
+        if (t == OFF_DER_V && ct) {
+            jvpCouplingPairs(balls, u0, u1, S, out, m, s);
+        } else if (t == OFF_V && tr) {
+            for (uint32_t q = 0; q < M(nImpacted); q++) {
+                const size_t i = M(impacted)[q];
+                const BallData* b = &balls[i];
+                double g = DDV_PREV(b) * viewAt(S, OFF_PRE_V, i);
+                if (eventMode) g += DDV_E(b) * viewAt(S, OFF_E, i);
+                if (g == 0.0) continue;
+                g *= IMPACT_TRANSFER * INV_K;
+                const size_t lo = nbLo(i) > u0 ? nbLo(i) : u0, hi = nbHi(i) < u1 ? nbHi(i) : u1;
+                for (size_t j = lo; j < hi; j++) {
+                    if (j != i) out[(j - u0) * m + s] += g;
+                }
+            }
+        }
+    }
+}
+
+static void vjpCouplingBlock(ModelInstance* comp, const ListPattern* K, const View* W, bool eventMode, double* out) {
+    const BallData* balls = comp->modelData.balls;
+    const size_t k0 = K->ball0, k1 = K->ball0 + K->nBalls, m = K->m;
+    const bool tr = M(nImpacted) > 0 && viewHas(W, OFF_V);
+    if (viewHas(W, OFF_DER_V)) {
+        vjpCouplingPairs(balls, K, W, out);  // all of h, v, c in one pass over the springs
+    }
+    for (size_t s = 0; s < m; s++) {
+        const size_t t = (size_t)K->types[s];
+        if (tr && (t == OFF_PRE_V || (t == OFF_E && eventMode))) {
+            for (uint32_t q = 0; q < M(nImpacted); q++) {
+                const size_t i = M(impacted)[q];
+                if (i >= k0 && i < k1) out[(i - k0) * m + s] += vjpTransfer(comp, t, i, W, eventMode);
+            }
+        }
+    }
+}
+#endif
+
+/* ---- generic path (arbitrary lists, struct-of-arrays scratch) ---------------------------------- */
+
+static void jvpGeneric(ModelInstance* comp, const ValueReference unknowns[], size_t nUnknowns,
+                       const ValueReference knowns[], size_t nKnowns,
+                       const double seed[], double sensitivity[], bool eventMode) {
+    double* s = ((LSSAData*)comp->lssa)->scratch;
+
+    for (size_t j = 0; j < nKnowns; j++) {
+        s[scratchIndex(knowns[j])] += seed[j];
+    }
+#if NUM_NEIGHBORS > 0
+    View S;
+    viewFromScratch(s, knowns, nKnowns, &S);
+#endif
+
+    for (size_t i = 0; i < nUnknowns; i++) {
+        const ValueReference vr = unknowns[i];
+        if (vr < START_VR) {
+            double d = jvpGlobalSelf(comp, vr, s);
+            if (vr == vr_nextEventTime && M(dTn_dpreh) != 0.0) {
+                const double* sp = s + NUM_GLOBAL_VRS + (size_t)OFF_PRE_H * NUM_BALLS;
+                double acc = 0.0;
+                for (size_t k = 0; k < NUM_BALLS; k++) {
+                    acc += sp[k];
+                }
+                d += M(dTn_dpreh) * acc;
+            }
+            sensitivity[i] = d;
+        } else {
+            const size_t offset = vr - START_VR;
+            const size_t ball = offset / VARS_PER_BALL;
+            const size_t type = offset % VARS_PER_BALL;
+            sensitivity[i] = jvpLocal(comp, &comp->modelData.balls[ball], type,
+                                      s + NUM_GLOBAL_VRS + ball, NUM_BALLS, s, eventMode);
+#if NUM_NEIGHBORS > 0
+            if (type == OFF_DER_V) {
+                sensitivity[i] += jvpCouplingDerV(comp->modelData.balls, ball, &S);
+            } else if (type == OFF_V) {
+                sensitivity[i] += jvpTransferV(comp, ball, &S, eventMode);
+            }
+#endif
+        }
+    }
+
+    for (size_t j = 0; j < nKnowns; j++) {
+        s[scratchIndex(knowns[j])] = 0.0;
+    }
+}
+
+static void vjpGeneric(ModelInstance* comp, const ValueReference unknowns[], size_t nUnknowns,
+                       const ValueReference knowns[], size_t nKnowns,
+                       const double seed[], double sensitivity[], bool eventMode) {
+    double* w = ((LSSAData*)comp->lssa)->scratch;
+
+    for (size_t i = 0; i < nUnknowns; i++) {
+        w[scratchIndex(unknowns[i])] += seed[i];
+    }
+#if NUM_NEIGHBORS > 0
+    View W;
+    viewFromScratch(w, unknowns, nUnknowns, &W);
+#endif
+
+    for (size_t j = 0; j < nKnowns; j++) {
+        const ValueReference vr = knowns[j];
+        if (vr < START_VR) {
+            double d = vjpGlobalSelf(comp, vr, w);
+            if (globalHasBallTerms(vr)) {
+                for (size_t k = 0; k < NUM_BALLS; k++) {
+                    d += vjpGlobalFromBall(comp, &comp->modelData.balls[k], vr, w + NUM_GLOBAL_VRS + k, NUM_BALLS, eventMode);
+                }
+            }
+            sensitivity[j] = d;
+        } else {
+            const size_t offset = vr - START_VR;
+            const size_t ball = offset / VARS_PER_BALL;
+            const size_t type = offset % VARS_PER_BALL;
+            sensitivity[j] = vjpLocal(comp, &comp->modelData.balls[ball], type,
+                                      w + NUM_GLOBAL_VRS + ball, NUM_BALLS, w, eventMode);
+#if NUM_NEIGHBORS > 0
+            if (type == OFF_H || type == OFF_V || type == OFF_C) {
+                sensitivity[j] += vjpCoupling(comp->modelData.balls, type, ball, &W);
+            } else if (type == OFF_PRE_V || type == OFF_E) {
+                sensitivity[j] += vjpTransfer(comp, type, ball, &W, eventMode);
+            }
+#endif
+        }
+    }
+
+    for (size_t i = 0; i < nUnknowns; i++) {
+        w[scratchIndex(unknowns[i])] = 0.0;
+    }
+}
+
+/* ---- fast paths (block structured lists): type-major streaming kernels -------------------------
+ * One tight loop over the balls per variable type of the output list (the switch is outside the loop),
+ * the seeds are read in place through per-type column pointers / strides (absent types: a zero with
+ * stride 0). Ball ranges of unknowns and knowns may differ: the output range is split into at most
+ * three segments (without / with / without seeds), so the loops contain no membership tests.
+ * The formulas are the same as in jvpLocal / vjpLocal (checked by the tests: fast == generic path). */
 
 // overlap [lo, hi) of the ball ranges [a0, a1) and [b0, b1); empty overlap: lo = hi = a1
 static void overlap(size_t a0, size_t a1, size_t b0, size_t b1, size_t* lo, size_t* hi) {
@@ -1176,6 +1564,15 @@ static bool jvpFast(ModelInstance* comp, const Plan* plan, const double seed[], 
             jvpKernel(comp, t, lo, hi, &cols, sg, eventMode, out + (lo - u0) * U->m, U->m);
             jvpKernel(comp, t, hi, u1, &none, sg, eventMode, out + (hi - u0) * U->m, U->m);
         }
+#if NUM_NEIGHBORS > 0
+        View S;
+        if (K->kind == LIST_BLOCK) {
+            viewFromBlock(K, seed, &S);
+        } else {
+            viewZero(&S);
+        }
+        jvpCouplingBlock(comp, U, &S, eventMode, sensitivity);
+#endif
         return true;
     }
 
@@ -1225,6 +1622,15 @@ static bool vjpFast(ModelInstance* comp, const Plan* plan, const double seed[], 
             vjpKernel(comp, t, lo, hi, &cols, wg, eventMode, out + (lo - k0) * K->m, K->m);
             vjpKernel(comp, t, hi, k1, &none, wg, eventMode, out + (hi - k0) * K->m, K->m);
         }
+#if NUM_NEIGHBORS > 0
+        View W;
+        if (U->kind == LIST_BLOCK) {
+            viewFromBlock(U, seed, &W);
+        } else {
+            viewZero(&W);
+        }
+        vjpCouplingBlock(comp, K, &W, eventMode, sensitivity);
+#endif
         return true;
     }
 

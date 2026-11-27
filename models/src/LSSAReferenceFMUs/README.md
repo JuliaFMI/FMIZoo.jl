@@ -65,6 +65,30 @@ outputs, state derivatives and event indicators: `der(h<i>)` on `v<i>`; `der(v<i
 the outputs on themselves. Initial unknowns have no `dependencies` attribute (may depend on all knowns).
 Importers can use them for sparse (colored) finite differences.
 
+## Coupled variant (NCoupledBouncingBalls)
+
+`NCoupledBouncingBalls_<N>_K<K>`: the same balls, each coupled to its `K` nearest neighbors (by index) on
+each side, `0 < |j - i| <= K` (built with `NUM_NEIGHBORS = K`; `K = 0` is exactly the model above):
+
+* `der(v<i>)` additionally contains the force of hardening springs with dampers,
+  `1/K * sum_j [ (c_i + c_j)/2 * phi(h_j - h_i) + 0.1 * (v_j - v_i) ]` with `phi(x) = x + x^3`.
+  `c_i` is the tunable parameter `spring_stiffness<i>` (offset 12, i.e. value reference
+  `100 + (i-1)*13 + offset` in this variant, start 1).
+* Impact transfer: after all bounces of an event iteration, every bounced (or clamped) ball `i` passes
+  `0.2/K` of its velocity change `dv_i = v+ - v-` to each of its neighbors (`v_j += 0.2/K * dv_i`).
+  `dv_i > 0`, so no further bounce is caused.
+
+The springs are nonlinear, so the coupling costs O(N*K) per evaluation for every importer, the same as the
+number of nonzeros of the Jacobian. The `dependencies` of `der(v<i>)` list `h`, `v`, `c` of the neighbors
+(dense for `K = N - 1`). LS-SA: the fast paths evaluate the coupling terms of the directional / adjoint
+derivatives spring by spring, each spring once for both balls, exactly like `fmi3GetContinuousStateDerivatives`
+evaluates the forces (O(N*K) for a whole Jacobian product, O(K) for a single ball; the generic path evaluates
+them per unknown); derivatives the coupling does not enter (e.g. w.r.t. time) cost nothing extra. The event map
+includes the impact transfer, evaluated from the list of balls that impacted (O(N + impacts * K)).
+
+Available for N = 3, 10, 30, 100, 300, 1000 and K = 1, 8, N - 1 (dense); K is capped at N - 1
+(e.g. `NCoupledBouncingBalls_3_K2` is both "K = 8" and "dense" for N = 3).
+
 ## LS-SA features
 
 * `fmi3GetDirectionalDerivative` / `fmi3GetAdjointDerivative` provide analytic partial derivatives for
@@ -162,7 +186,7 @@ least `fmi3SetContinuousStates` + `fmi3GetEventIndicators` (about 2.5 µs); a co
   `providesAdjointDerivatives` flag.
 * `0.2.0`: everything above (N = 1, 3, 10, 30, 100, 300, 1000), binaries for x86_64-windows
   (MSVC 2022 `/O2`, static runtime) and x86_64-linux (GCC 15 `-O3`, needs glibc >= 2.14), declared
-  `dependencies`.
+  `dependencies`; coupled variant `NCoupledBouncingBalls_<N>_K<K>` (N = 3 ... 1000, K = 1, 8, N - 1).
   Note the changed time event scheduling (first kick no longer at `0.7 * base_event_period`).
 
 ## Building
@@ -173,4 +197,6 @@ binaries of the other platform in an existing FMU are kept. Both scripts stop if
 different `modelDescription.xml` (its binaries were built from different sources). Variants go to a
 separate build and output directory, e.g. without the plan cache:
 `build_fmus.ps1 -BuildDir build-nocache -OutDir <dir> -CMakeArgs "-DLSSA_PLAN_CACHE=OFF"` or
-`./build_fmus.sh -b build-linux-nocache -o <dir> -- -DLSSA_PLAN_CACHE=OFF`.
+`./build_fmus.sh -b build-linux-nocache -o <dir> -- -DLSSA_PLAN_CACHE=OFF`. The coupled variant:
+`build_fmus.ps1 -Counts 3,10,30,100,300,1000 -Neighbors 1,8,-1` / `./build_fmus.sh -n "3 10 30 100 300 1000" -k "1 8 -1"`
+(`-1`: dense).

@@ -10,6 +10,10 @@
 # Needs cmake (>= 3.15) and gcc. All FMUs of one version must be built with the same compiler / flags per platform
 # (they are used for benchmarks). Variants go to a separate build and output directory, e.g.
 #   ./build_fmus.sh -b build-linux-nocache -o /tmp/nocache -- -DLSSA_PLAN_CACHE=OFF
+#
+# Coupled variant (NCoupledBouncingBalls_<N>_K<K>.fmu): -k lists the neighbors per side K; K is capped at N - 1
+# (-1: dense, K = N - 1), N = 1 (no neighbors) and duplicates are skipped:
+#   ./build_fmus.sh -n "3 10 30 100 300 1000" -k "1 8 -1"
 set -euo pipefail
 
 src="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,13 +21,15 @@ version="0.2.0"
 counts="1 3 10 30 100 300 1000"
 build_dir="build-linux"
 out=""
-while getopts "v:n:b:o:" opt; do
+neighbors=""
+while getopts "v:n:b:o:k:" opt; do
     case "$opt" in
         v) version="$OPTARG" ;;
         n) counts="$OPTARG" ;;
         b) build_dir="$OPTARG" ;;
         o) out="$OPTARG" ;;
-        *) echo "usage: $0 [-v VERSION] [-n COUNTS] [-b BUILD_DIR] [-o OUT_DIR] [-- CMAKE_ARGS...]" >&2; exit 2 ;;
+        k) neighbors="$OPTARG" ;;
+        *) echo "usage: $0 [-v VERSION] [-n COUNTS] [-k NEIGHBORS] [-b BUILD_DIR] [-o OUT_DIR] [-- CMAKE_ARGS...]" >&2; exit 2 ;;
     esac
 done
 shift $((OPTIND - 1))
@@ -55,12 +61,32 @@ merge_into() {
     rm -rf "$tmp"
 }
 
+# (N, K) pairs to build: K = 0 is the uncoupled model
+builds=""
 for n in $counts; do
-    build="$src/$build_dir/n$n"
-    echo "=== N = $n ==="
-    cmake -S "$src" -B "$build" -DCMAKE_BUILD_TYPE=Release "-DNUM_BALLS=$n" "${cmake_args[@]}"
+    if [[ -z "$neighbors" ]]; then
+        builds="$builds $n:0"
+        continue
+    fi
+    for k in $neighbors; do
+        if (( k < 0 || k > n - 1 )); then keff=$((n - 1)); else keff=$k; fi
+        (( keff >= 1 )) || continue
+        [[ " $builds " == *" $n:$keff "* ]] || builds="$builds $n:$keff"
+    done
+done
+
+for nk in $builds; do
+    n=${nk%%:*}
+    k=${nk##*:}
+    if (( k == 0 )); then
+        name="NBouncingBalls_$n"; build="$src/$build_dir/n$n"
+    else
+        name="NCoupledBouncingBalls_${n}_K$k"; build="$src/$build_dir/n${n}_k$k"
+    fi
+    echo "=== $name ==="
+    cmake -S "$src" -B "$build" -DCMAKE_BUILD_TYPE=Release "-DNUM_BALLS=$n" "-DNUM_NEIGHBORS=$k" "${cmake_args[@]}"
     cmake --build "$build"
-    target="$out/NBouncingBalls_$n.fmu"
+    target="$out/$name.fmu"
     merge_into "$build/fmu_staging" "$target"
     echo "-> $target ($(cmake -E tar tf "$target" | grep -c '^binaries/.*/NBouncingBalls\.' ) platform binaries)"
 done

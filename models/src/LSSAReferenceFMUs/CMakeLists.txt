@@ -21,6 +21,14 @@ endif()
 
 set(START_VR 100)
 
+# coupled variant "NCoupledBouncingBalls": springs / impact transfer to NUM_NEIGHBORS neighbors on each side
+# (0: uncoupled model "NBouncingBalls", same variables and code as before)
+set(NUM_NEIGHBORS 0 CACHE STRING "Coupled variant: neighbors per side (0: uncoupled)")
+if(NUM_NEIGHBORS GREATER_EQUAL NUM_BALLS AND NUM_NEIGHBORS GREATER 0)
+    message(FATAL_ERROR "NUM_NEIGHBORS (${NUM_NEIGHBORS}) must be smaller than NUM_BALLS (${NUM_BALLS})")
+endif()
+add_compile_definitions(NUM_NEIGHBORS=${NUM_NEIGHBORS})
+
 message(STATUS "--- Konfiguriere FMU für ${NUM_BALLS} Bälle ---")
 add_compile_definitions(NUM_BALLS=${NUM_BALLS})
 add_compile_definitions(START_VR=${START_VR}) 
@@ -33,7 +41,16 @@ set(SOURCE_FILES
     src/fmi3Functions.c )
 
 set(START_VR 100)
-set(VARS_PER_BALL 12)
+if(NUM_NEIGHBORS GREATER 0)
+    set(VARS_PER_BALL 13)
+    set(OFF_C 12)
+    set(MODEL_NAME "NCoupledBouncingBalls")
+    set(MODEL_DESCRIPTION "This model calculates the trajectory, over time, of N balls dropped from a height, each coupled to its ${NUM_NEIGHBORS} nearest neighbors on each side (springs, impact transfer).")
+else()
+    set(VARS_PER_BALL 12)
+    set(MODEL_NAME "NBouncingBalls")
+    set(MODEL_DESCRIPTION "This model calculates the trajectory, over time, of N balls dropped from a height.")
+endif()
 
 set(OFF_H 0)
 set(OFF_DER_H 1)
@@ -52,6 +69,19 @@ set(XML_MODEL_VARIABLES "")
 set(XML_MODEL_STRUCTURE "")
 set(LS_MODEL_VARIABLES "")
 set(LS_MODEL_STRUCTURE "")
+
+# coupled variant: per ball the value references "h v c" its neighbors' der(v) depend on (list, one entry per ball);
+# the dependencies of der(v_i) are sublists of it (fast also for dense coupling, K = NUM_BALLS - 1)
+set(NEIGHBOR_DEPS "")
+if(NUM_NEIGHBORS GREATER 0)
+    foreach(i RANGE 1 ${NUM_BALLS})
+        math(EXPR BASE_VR "${START_VR} + (${i} - 1) * ${VARS_PER_BALL}")
+        math(EXPR VR_H "${BASE_VR} + ${OFF_H}")
+        math(EXPR VR_V "${BASE_VR} + ${OFF_V}")
+        math(EXPR VR_C "${BASE_VR} + ${OFF_C}")
+        list(APPEND NEIGHBOR_DEPS "${VR_H} ${VR_V} ${VR_C}")
+    endforeach()
+endif()
 
 foreach(i RANGE 1 ${NUM_BALLS})
     
@@ -94,12 +124,17 @@ foreach(i RANGE 1 ${NUM_BALLS})
     string(APPEND XML_MODEL_VARIABLES "    <Float64 name=\"pre(v${i})\" valueReference=\"${VR_PRE_V}\" causality=\"local\" variability=\"discrete\" declaredType=\"Velocity\"/>\n")
     string(APPEND XML_MODEL_VARIABLES "    <Float64 name=\"error_h_start${i}\" valueReference=\"${VR_ERR}\" causality=\"local\" variability=\"continuous\"/>\n")
     string(APPEND XML_MODEL_VARIABLES "    <Float64 name=\"event_indicator_ground${i}\" valueReference=\"${VR_EVENT}\" causality=\"local\" variability=\"continuous\"/>\n")
+    if(NUM_NEIGHBORS GREATER 0)
+        math(EXPR VR_C "${BASE_VR} + ${OFF_C}")
+        string(APPEND XML_MODEL_VARIABLES "    <Float64 name=\"spring_stiffness${i}\" valueReference=\"${VR_C}\" causality=\"parameter\" variability=\"tunable\" initial=\"exact\" start=\"1\" min=\"0\" description=\"Stiffness of the springs to the neighbors (pairwise mean)\"/>\n")
+    endif()
 
     # --- XML_MODEL_STRUCTURE
     # `dependencies` (FMI 3.0 knowns: states, inputs, parameters, independent variable), from the equations in
     # src/model.c; checked against the analytic Jacobian by fmi-ls-sa/benchmarks/test_fmu.jl:
     #   der(h) = v
     #   der(v) = g + k * time - drag_coefficient * (1 - e) * v * |v|
+    #            (coupled: + force of the springs / dampers to the neighbors, depends on h, v, c of the neighbors)
     #   z      = h + ground_flexibility * (1 - e)            (event indicator)
     # InitialUnknowns stay without `dependencies` (= may depend on all knowns).
     set(VR_TIME 0)
@@ -110,7 +145,30 @@ foreach(i RANGE 1 ${NUM_BALLS})
     string(APPEND STRUC_OUTPUTS "    <Output valueReference=\"${VR_V}\" dependencies=\"${VR_V}\"/>\n")
 
     string(APPEND STRUC_DERIVATIVES "    <ContinuousStateDerivative valueReference=\"${VR_DER_H}\" dependencies=\"${VR_V}\"/>\n")
-    string(APPEND STRUC_DERIVATIVES "    <ContinuousStateDerivative valueReference=\"${VR_DER_V}\" dependencies=\"${VR_TIME} ${VR_G} ${VR_V} ${VR_E} ${VR_K} ${VR_DRAG}\"/>\n")
+    if(NUM_NEIGHBORS GREATER 0)
+        # ascending value references: time, g, then per ball of the window h, v, (own: e, k, drag), c
+        math(EXPR NB_LO "${i} - ${NUM_NEIGHBORS}")
+        if(NB_LO LESS 1)
+            set(NB_LO 1)
+        endif()
+        math(EXPR NB_HI "${i} + ${NUM_NEIGHBORS}")
+        if(NB_HI GREATER NUM_BALLS)
+            set(NB_HI ${NUM_BALLS})
+        endif()
+        math(EXPR NB_BEFORE_BEGIN "${NB_LO} - 1")
+        math(EXPR NB_BEFORE_LEN "${i} - ${NB_LO}")
+        math(EXPR NB_AFTER_LEN "${NB_HI} - ${i}")
+        list(SUBLIST NEIGHBOR_DEPS ${NB_BEFORE_BEGIN} ${NB_BEFORE_LEN} DEPS_BEFORE)
+        set(DEPS_AFTER "")
+        if(NB_AFTER_LEN GREATER 0)
+            list(SUBLIST NEIGHBOR_DEPS ${i} ${NB_AFTER_LEN} DEPS_AFTER)
+        endif()
+        set(DEPS_LIST "${VR_TIME}" "${VR_G}" ${DEPS_BEFORE} "${VR_H} ${VR_V} ${VR_E} ${VR_K} ${VR_DRAG} ${VR_C}" ${DEPS_AFTER})
+        string(JOIN " " DEPS_DER_V ${DEPS_LIST})
+        string(APPEND STRUC_DERIVATIVES "    <ContinuousStateDerivative valueReference=\"${VR_DER_V}\" dependencies=\"${DEPS_DER_V}\"/>\n")
+    else()
+        string(APPEND STRUC_DERIVATIVES "    <ContinuousStateDerivative valueReference=\"${VR_DER_V}\" dependencies=\"${VR_TIME} ${VR_G} ${VR_V} ${VR_E} ${VR_K} ${VR_DRAG}\"/>\n")
+    endif()
 
     string(APPEND STRUC_INITIALS "    <InitialUnknown valueReference=\"${VR_DER_H}\"/>\n")
     string(APPEND STRUC_INITIALS "    <InitialUnknown valueReference=\"${VR_DER_V}\"/>\n")

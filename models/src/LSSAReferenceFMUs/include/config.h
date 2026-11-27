@@ -48,7 +48,19 @@ typedef enum {
 #ifndef START_VR
 #define START_VR 100
 #endif
+
+// Coupled variant ("NCoupledBouncingBalls", NUM_NEIGHBORS > 0): every ball is connected to its NUM_NEIGHBORS
+// nearest neighbors (by index) on each side by a hardening spring with damper, and passes a share of its
+// impact impulse to them. NUM_NEIGHBORS = 0 is the uncoupled model (identical code and variables).
+#ifndef NUM_NEIGHBORS
+#define NUM_NEIGHBORS 0
+#endif
+
+#if NUM_NEIGHBORS > 0
+#define VARS_PER_BALL 13
+#else
 #define VARS_PER_BALL 12
+#endif
 
 #define OFF_H 0
 #define OFF_DER_H 1
@@ -62,6 +74,17 @@ typedef enum {
 #define OFF_PRE_V 9
 #define OFF_ERR_H 10
 #define OFF_EVENT_G 11
+#if NUM_NEIGHBORS > 0
+#define OFF_C 12            // spring stiffness c_i (tunable parameter)
+
+// coupling force on ball i (normalized by NUM_NEIGHBORS, so that its size does not grow with the coupling width):
+//   F_i = 1/K * sum_{0 < |j-i| <= K} [ (c_i + c_j)/2 * phi(h_j - h_i) + COUPLING_DAMPING * (v_j - v_i) ]
+//   phi(x) = x + SPRING_CUBIC * x^3 (hardening spring)
+// impact of ball i (bounce or clamp, velocity change dv_i): v_j += IMPACT_TRANSFER / K * dv_i for its neighbors j
+#define COUPLING_DAMPING 0.1
+#define SPRING_CUBIC 1.0
+#define IMPACT_TRANSFER 0.2
+#endif
 
 // Time events: every kick schedules the next one at
 //   t_next = t + base_event_period * (1 + EVENT_HEIGHT_COUPLING * mean_i(pre(h_i)))
@@ -99,7 +122,12 @@ typedef struct {
     // LS-SA: event branch taken in the last event iteration (EVENT_*), 1 byte instead of a cached Jacobian
     uint8_t eventKind;
 
-} BallData; // 64 bytes
+#if NUM_NEIGHBORS > 0
+    // spring stiffness (tunable parameter)
+    double c;
+#endif
+
+} BallData; // 64 bytes (coupled: 72 bytes)
 
 typedef struct {
     BallData balls[NUM_BALLS];
@@ -119,6 +147,13 @@ typedef struct {
     double dTn_dtime; // d nextEventTime / d time (of the current event)
     double dTn_dpreh; // d nextEventTime / d pre(h_i), identical for all balls
     double dTn_dbase; // d nextEventTime / d base_event_period
+
+#if NUM_NEIGHBORS > 0
+    // balls that bounced / were clamped in the last event iteration (their impulse was passed to the neighbors);
+    // LS-SA evaluates the coupling part of the event map from this list
+    uint32_t impacted[NUM_BALLS];
+    uint32_t nImpacted;
+#endif
 
 } ModelData;
 

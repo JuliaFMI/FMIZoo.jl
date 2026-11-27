@@ -11,6 +11,10 @@
 #
 # Variants (e.g. for benchmarking without the plan cache) go to a separate build and output directory:
 #   build_fmus.ps1 -BuildDir build-nocache -OutDir C:\tmp\nocache -CMakeArgs "-DLSSA_PLAN_CACHE=OFF"
+#
+# Coupled variant (NCoupledBouncingBalls_<N>_K<K>.fmu): -Neighbors lists the neighbors per side K; K is capped at
+# N - 1 (-1: dense, K = N - 1), N = 1 (no neighbors) and duplicates are skipped:
+#   build_fmus.ps1 -Counts 3,10,30,100,300,1000 -Neighbors 1,8,-1
 param(
     [string]$Version = "0.2.0",
     [int[]]$Counts = @(1, 3, 10, 30, 100, 300, 1000),
@@ -18,7 +22,8 @@ param(
     [string]$CMake = "",
     [string]$BuildDir = "build",
     [string]$OutDir = "",
-    [string[]]$CMakeArgs = @()
+    [string[]]$CMakeArgs = @(),
+    [int[]]$Neighbors = @()
 )
 
 $ErrorActionPreference = "Stop"
@@ -74,17 +79,34 @@ function Merge-FmuContent([string]$staging, [string]$target) {
     }
 }
 
+# (N, K) pairs to build: K = 0 is the uncoupled model
+$builds = @()
 foreach ($n in $Counts) {
-    $build = Join-Path $src "$BuildDir\n$n"
-    Write-Host "=== N = $n ==="
+    if ($Neighbors.Count -eq 0) {
+        $builds += , @($n, 0)
+        continue
+    }
+    foreach ($k in $Neighbors) {
+        $keff = if ($k -lt 0 -or $k -gt $n - 1) { $n - 1 } else { $k }
+        if ($keff -lt 1) { continue }
+        if (-not ($builds | Where-Object { $_[0] -eq $n -and $_[1] -eq $keff })) { $builds += , @($n, $keff) }
+    }
+}
 
-    & $CMake -S $src -B $build -G $Generator @platformArgs "-DNUM_BALLS=$n" @CMakeArgs
-    if ($LASTEXITCODE -ne 0) { throw "CMake configure failed for N = $n" }
+foreach ($nk in $builds) {
+    $n = $nk[0]
+    $k = $nk[1]
+    $name = if ($k -eq 0) { "NBouncingBalls_$n" } else { "NCoupledBouncingBalls_${n}_K$k" }
+    $build = if ($k -eq 0) { Join-Path $src "$BuildDir\n$n" } else { Join-Path $src "$BuildDir\n${n}_k$k" }
+    Write-Host "=== $name ==="
+
+    & $CMake -S $src -B $build -G $Generator @platformArgs "-DNUM_BALLS=$n" "-DNUM_NEIGHBORS=$k" @CMakeArgs
+    if ($LASTEXITCODE -ne 0) { throw "CMake configure failed for $name" }
 
     & $CMake --build $build --config Release
-    if ($LASTEXITCODE -ne 0) { throw "Build failed for N = $n" }
+    if ($LASTEXITCODE -ne 0) { throw "Build failed for $name" }
 
-    $target = Join-Path $out "NBouncingBalls_$n.fmu"
+    $target = Join-Path $out "$name.fmu"
     Merge-FmuContent (Join-Path $build "fmu_staging") $target
     Write-Host "-> $target"
 }
